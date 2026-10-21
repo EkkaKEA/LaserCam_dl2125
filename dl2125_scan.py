@@ -258,6 +258,9 @@ def open_camera(device_info, exclusive=True):
         cam.MV_CC_DestroyHandle()
         check(ret, 'MV_CC_OpenDevice')
 
+    # Печать исключений видеопотока — помогает видеть обрывы и переполнения буфера
+    register_stream_exception_callback(cam)
+
     # Для GigE уменьшает потери пакетов на длинном кабеле/через свитч
     if device_info.nTLayerType in (MV_GIGE_DEVICE, MV_GENTL_GIGE_DEVICE):
         packet = cam.MV_CC_GetOptimalPacketSize()
@@ -272,12 +275,61 @@ def open_camera(device_info, exclusive=True):
 
 
 def close_camera(cam):
-    """Останавливает съёмку (если шла), закрывает камеру и освобождает дескриптор."""
-    if cam is None:
+    """Останавливает съёмку (если шла), закрывает камеру и освобождает дескриптор.
+
+    Каждый вызов защищён: повторное закрытие или уже освобождённый дескриптор
+    не должны ронять процесс (нативная ошибка SDK = мгновенный вылет Python).
+    """
+    if cam is None or getattr(cam, '_closed', False):
         return
-    cam.MV_CC_StopGrabbing()
-    cam.MV_CC_CloseDevice()
-    cam.MV_CC_DestroyHandle()
+    cam._closed = True
+    for name in ('MV_CC_StopGrabbing', 'MV_CC_CloseDevice', 'MV_CC_DestroyHandle'):
+        try:
+            getattr(cam, name)()
+        except Exception as exc:
+            print('ПРЕДУПРЕЖДЕНИЕ %s: %s' % (name, exc))
+
+
+# Глобальная ссылка на колбэк исключений — иначе ctypes «соберёт» мусор и SDK упадёт
+_STREAM_EXCEPTION_CB = None
+
+
+def _stream_exception_callback(p_info, p_user):
+    """Печатает исключения видеопотока: обрыв связи, переполнение буфера и т.п."""
+    try:
+        info = cast(p_info, POINTER(MV_CC_STREAM_EXCEPTION_INFO)).contents
+        code = int(info.enExceptionType)
+        names = {
+            MV_CC_STREAM_EXCEPTION_ABNORMAL_IMAGE: 'ANOMALY_IMAGE (неправильная длина кадра)',
+            MV_CC_STREAM_EXCEPTION_LIST_OVERFLOW: 'LIST_OVERFLOW (кадры не успевали забираться)',
+            MV_CC_STREAM_EXCEPTION_LIST_EMPTY: 'LIST_EMPTY (кадр не возвращён вовремя)',
+            MV_CC_STREAM_EXCEPTION_RECONNECTION: 'RECONNECTION (идёт восстановление связи)',
+            MV_CC_STREAM_EXCEPTION_DISCONNECTED: 'DISCONNECTED (камера отвалилась)',
+            MV_CC_STREAM_EXCEPTION_DEVICE: 'DEVICE (устройство не в норме)',
+            MV_CC_STREAM_EXCEPTION_PARTIAL_IMAGE: 'PARTIAL_IMAGE (неполный кадр отброшен)',
+            MV_CC_STREAM_EXCEPTION_IMAGE_BUFFER_OVERFLOW: 'BUFFER_OVERFLOW (кадр больше буфера)',
+        }
+        print('ИСКЛЮЧЕНИЕ ВИДЕОПОТОКА: 0x%X %s' % (code, names.get(code, '')))
+    except Exception:
+        pass
+
+
+def register_stream_exception_callback(cam):
+    """Подключает обработчик исключений видеопотока (для диагностики обрывов).
+
+    Вызываем DLL напрямую с правильными argtypes: обёртка задаёт c_void_p и
+    ctypes не умеет превратить функцию в такой аргумент.
+    """
+    global _STREAM_EXCEPTION_CB
+    try:
+        fun_ctype = get_platform_functype()
+        _STREAM_EXCEPTION_CB = fun_ctype(None, POINTER(MV_CC_STREAM_EXCEPTION_INFO), c_void_p)
+        dll = MvCamCtrldll
+        dll.MV_CC_RegisterExceptionCallBack.argtypes = (c_void_p, fun_ctype, c_void_p)
+        dll.MV_CC_RegisterExceptionCallBack.restype = c_uint
+        dll.MV_CC_RegisterExceptionCallBack(cam.handle, _STREAM_EXCEPTION_CB, None)
+    except Exception as exc:
+        print('ПРЕДУПРЕЖДЕНИЕ: не удалось зарегистрировать обработчик исключений: %s' % exc)
 
 
 # ---------------------------------------------------------------------------
@@ -570,18 +622,25 @@ def read_chunks(frame_struct):
     """Считывает chunk-данные кадра (пока буфер SDK ещё не освобождён).
 
     Возвращает список словарей {'id': int, 'data': bytes}.
+    Защищено от мусорных значений: нативное обращение по неверному указателю
+    мгновенно роняет процесс, поэтому все поля проверяются.
     """
     chunks = []
-    count = int(frame_struct.stFrameInfo.nUnparsedChunkNum)
-    if count <= 0:
-        return chunks
-    head = frame_struct.stFrameInfo.UnparsedChunkList.pUnparsedChunkContent
-    for i in range(count):
-        item = cast(head, POINTER(MV_CHUNK_DATA_CONTENT))[i]
-        length = int(item.nChunkLen)
-        if length <= 0 or item.pChunkData is None:
-            continue
-        chunks.append({'id': int(item.nChunkID), 'data': string_at(item.pChunkData, length)})
+    try:
+        count = int(frame_struct.stFrameInfo.nUnparsedChunkNum)
+        if count <= 0 or count > 32:  # реальные chunk-блоки — единицы, не сотни
+            return chunks
+        head = frame_struct.stFrameInfo.UnparsedChunkList.pUnparsedChunkContent
+        if not head:
+            return chunks
+        for i in range(count):
+            item = cast(head, POINTER(MV_CHUNK_DATA_CONTENT))[i]
+            length = int(item.nChunkLen)
+            if length <= 0 or length > (1 << 20) or not item.pChunkData:
+                continue
+            chunks.append({'id': int(item.nChunkID), 'data': string_at(item.pChunkData, length)})
+    except Exception as exc:
+        print('ПРЕДУПРЕЖДЕНИЕ: chunk-данные не прочитаны: %s' % exc)
     return chunks
 
 
@@ -667,21 +726,25 @@ FORMAT_TABLE = None  # заполняется лениво, т.к. конста�
 
 
 def _format_table():
+    """Таблица форматов: (имя, код dtype numpy, байт на пиксель).
+
+    Коды — строки ('u1', 'f4'), чтобы отчёт о кадре работал БЕЗ numpy;
+    numpy нужен только для расчётов (frame_to_array/measure).
+    """
     global FORMAT_TABLE
     if FORMAT_TABLE is None:
-        import numpy as np
         FORMAT_TABLE = {
-            PixelType_Gvsp_Mono8: ('Mono8', np.uint8, 1),
-            PixelType_Gvsp_Mono16: ('Mono16', np.uint16, 2),
+            PixelType_Gvsp_Mono8: ('Mono8', 'u1', 1),
+            PixelType_Gvsp_Mono16: ('Mono16', 'u2', 2),
             # C16 — высота по одной оси, обычно в микрометрах (uint16)
-            PixelType_Gvsp_Coord3D_C16: ('Coord3D_C16', np.uint16, 2),
-            PixelType_Gvsp_Coord3D_C32: ('Coord3D_C32', np.int32, 4),
+            PixelType_Gvsp_Coord3D_C16: ('Coord3D_C16', 'u2', 2),
+            PixelType_Gvsp_Coord3D_C32: ('Coord3D_C32', 'i4', 4),
             # C32f — высота в мм с плавающей точкой
-            PixelType_Gvsp_Coord3D_C32f: ('Coord3D_C32f', np.float32, 4),
+            PixelType_Gvsp_Coord3D_C32f: ('Coord3D_C32f', 'f4', 4),
             # ABC32f — по три float на пиксель: X, Y, Z
-            PixelType_Gvsp_Coord3D_ABC32f: ('Coord3D_ABC32f', np.float32, 12),
+            PixelType_Gvsp_Coord3D_ABC32f: ('Coord3D_ABC32f', 'f4', 12),
             # AC32f — два float на пиксель: интенсивность и Z
-            PixelType_Gvsp_Coord3D_AC32f: ('Coord3D_AC32f', np.float32, 8),
+            PixelType_Gvsp_Coord3D_AC32f: ('Coord3D_AC32f', 'f4', 8),
         }
     return FORMAT_TABLE
 
@@ -715,64 +778,108 @@ def frame_to_array(frame):
             'Формат пикселей %s не встроен в таблицу форматов. '
             'Добавьте его в _format_table() или сохраните кадр через save_raw().' % info['pixel_type_hex'])
 
-    arr = np.frombuffer(frame['data'], dtype=info['dtype'], count=frame['width'] * frame['height'])
-    shape = (frame['height'], frame['width'], 3) if info['format'] == 'Coord3D_ABC32f' \
-        else (frame['height'], frame['width'])
-    return arr.reshape(shape).copy()
+    dtype = np.dtype(info['dtype'])
+    arr = np.frombuffer(frame['data'], dtype=dtype, count=len(frame['data']) // dtype.itemsize)
+    if info['format'] == 'Coord3D_ABC32f':
+        return arr.reshape((frame['height'], frame['width'], 3)).copy()
+    if info['format'] == 'Coord3D_AC32f':
+        return arr.reshape((frame['height'], frame['width'], 2)).copy()
+    return arr.reshape((frame['height'], frame['width'])).copy()
 
 
 # ---------------------------------------------------------------------------
 # 9. СОХРАНЕНИЕ КАДРА
 # ---------------------------------------------------------------------------
 
-POINT_CLOUD_FORMATS = {
-    'ply': (MV_PointCloudFile_PLY, '.ply'),
-    'csv': (MV_PointCloudFile_CSV, '.csv'),
-    'obj': (MV_PointCloudFile_OBJ, '.obj'),
-}
 
+def frame_points_mm(frame, x_mm_per_px=0.1, y_mm_per_px=0.1, z_scale=1000.0):
+    """Список точек (x_мм, y_мм, z_мм) для валидных пикселей кадра.
 
-def save_point_cloud(cam, frame, path, fmt='ply'):
-    """Сохраняет кадр-профиль в файл облака точек (PLY/CSV/OBJ) силами SDK.
-
-    PLY — для просмотра в MeshLab/CloudCompare, CSV — таблицей для Excel,
-    OBJ — для 3D-редакторов.
+    Поддерживаемые форматы:
+      Coord3D_C16  — профиль высот в единицах SDK (мкм при z_scale=1000);
+      Coord3D_C32f — высота в мм с плавающей точкой;
+      Coord3D_ABC32f — готовые координаты X, Y, Z (калиброванные, мм).
+    Невалидные точки (0 / NaN) пропускаются.
+    Работает без numpy — на чистом Python (array).
     """
+    import array as _array
+    width = frame['width']
+    pixel_type = frame['pixel_type']
+    pts = []
+    if pixel_type == PixelType_Gvsp_Coord3D_C16:
+        values = _array.array('H')  # uint16 little-endian
+        values.frombytes(frame['data'])
+        for idx, value in enumerate(values):
+            if value == 0:  # 0 = нет отражения/нет данных
+                continue
+            row, col = divmod(idx, width)
+            pts.append((col * x_mm_per_px, row * y_mm_per_px, value / z_scale))
+    elif pixel_type == PixelType_Gvsp_Coord3D_C32f:
+        values = _array.array('f')
+        values.frombytes(frame['data'])
+        for idx, value in enumerate(values):
+            if value != value:  # NaN
+                continue
+            row, col = divmod(idx, width)
+            pts.append((col * x_mm_per_px, row * y_mm_per_px, value))
+    elif pixel_type == PixelType_Gvsp_Coord3D_ABC32f:
+        values = _array.array('f')
+        values.frombytes(frame['data'])
+        for i in range(0, len(values) - 2, 3):
+            x, y, z = values[i], values[i + 1], values[i + 2]
+            if z != z or z == 0.0:
+                continue
+            pts.append((x, y, z))
+    else:
+        raise RuntimeError(
+            'Для формата 0x%08X облако точек не строится. Нужен Coord3D_C16/C32f/ABC32f — '
+            'снимайте с --image-mode PointCloud3D' % pixel_type)
+    return pts
+
+
+def save_point_cloud(frame, path, fmt='ply', x_mm_per_px=0.1, y_mm_per_px=0.1, z_scale=1000.0):
+    """Сохраняет кадр-профиль как облако точек: PLY / CSV / OBJ.
+
+    Пишется на хосте (без MV_CC_SavePointCloudData): SDK этой камеры отвергает
+    Coord3D_C16 с ошибкой MV_E_PARAMETER, а свой писатель работает для всех
+    поддерживаемых форматов и не требует numpy.
+    """
+    import array as _array
     fmt = fmt.lower()
-    if fmt not in POINT_CLOUD_FORMATS:
-        raise RuntimeError('Поддерживаемые форматы: %s' % ', '.join(POINT_CLOUD_FORMATS))
-    file_type, ext = POINT_CLOUD_FORMATS[fmt]
+    if fmt not in ('ply', 'csv', 'obj'):
+        raise RuntimeError('Поддерживаемые форматы: ply, csv, obj')
+    ext = '.' + fmt
     if not path.lower().endswith(ext):
         path += ext
     path = sdk_path(path)
 
-    # Буфер источника: копия байт кадра
-    src = (c_ubyte * len(frame['data'])).from_buffer_copy(frame['data'])
-    # Резерв по документации SDK: nLinePntNum * nLineNum * (16*3 + 4) + 2048
-    dst_size = frame['width'] * frame['height'] * (16 * 3 + 4) + 2048
-    dst = (c_ubyte * dst_size)()
+    pts = frame_points_mm(frame, x_mm_per_px, y_mm_per_px, z_scale)
+    if not pts:
+        raise RuntimeError('В кадре нет валидных точек (все невалидные/нулевые)')
 
-    param = MV_SAVE_POINT_CLOUD_PARAM()
-    memset(byref(param), 0, sizeof(param))
-    param.nLinePntNum = frame['width']
-    param.nLineNum = frame['height']
-    param.enSrcPixelType = frame['pixel_type']
-    param.pSrcData = cast(src, POINTER(c_ubyte))
-    param.nSrcDataLen = len(frame['data'])
-    param.pDstBuf = cast(dst, POINTER(c_ubyte))
-    param.nDstBufSize = dst_size
-    param.enPointCloudFileType = file_type
+    if fmt == 'ply':
+        header = ('ply\nformat binary_little_endian 1.0\n'
+                  'comment units: mm (x,y from pixel size, z from z_scale)\n'
+                  'element vertex %d\nproperty float x\nproperty float y\nproperty float z\n'
+                  'end_header\n' % len(pts))
+        buf = _array.array('f')
+        for x, y, z in pts:
+            buf.extend((x, y, z))
+        with open(path, 'wb') as f:
+            f.write(header.encode('ascii'))
+            buf.tofile(f)
+    elif fmt == 'csv':
+        with open(path, 'w', encoding='ascii') as f:
+            f.write('x_mm;y_mm;z_mm\n')
+            for x, y, z in pts:
+                f.write('%.4f;%.4f;%.4f\n' % (x, y, z))
+    else:  # obj
+        with open(path, 'w', encoding='ascii') as f:
+            f.write('# MV-DL2125 point cloud, units: mm\n')
+            for x, y, z in pts:
+                f.write('v %.4f %.4f %.4f\n' % (x, y, z))
 
-    ret = cam.MV_CC_SavePointCloudData(param)
-    if ret != 0:
-        raise RuntimeError(
-            'MV_CC_SavePointCloudData(%s): ошибка SDK 0x%08X. '
-            'Частая причина — кадр не 3D: формат 0x%08X (это Mono8 — снимок лазерной полосы, а не карта высот). '
-            'Попробуйте повторить съёмку с ключом --image-mode PointCloud3D '
-            '(узел ImageMode найден в дампе параметров этой камеры), затем проверьте PixelFormat в отчёте '
-            '— должен стать Coord3D_*'
-            % (path, ret & 0xFFFFFFFF, frame['pixel_type']))
-    print('Облако точек сохранено: %s (%d байт)' % (path, param.nDstBufLen))
+    print('Облако точек сохранено: %s (%d точек, %s)' % (path, len(pts), fmt))
     return path
 
 
@@ -1093,19 +1200,26 @@ def run_scan(args):
                         print('ПРЕДУПРЕЖДЕНИЕ: не удалось сохранить RAW: %s' % exc)
 
                 if info['known']:
-                    for flag, saver, kind_name in (
-                        (args.ply, save_point_cloud, 'ply'),
-                        (args.csv, save_point_cloud, 'csv'),
-                        (args.obj, save_point_cloud, 'obj'),
-                        (args.png, save_image, 'png'),
-                    ):
+                    for flag, kind_name in ((args.ply, 'ply'), (args.csv, 'csv'), (args.obj, 'obj')):
                         if not flag:
                             continue
                         # Ошибка сохранения одного формата не должна ронять весь скан
                         try:
-                            saver(cam, frame, base, kind_name)
+                            save_point_cloud(frame, base, kind_name,
+                                             x_mm_per_px=args.x_mm_per_px,
+                                             y_mm_per_px=args.y_mm_per_px,
+                                             z_scale=args.z_scale)
                         except Exception as exc:
                             print('ПРЕДУПРЕЖДЕНИЕ: не удалось сохранить %s: %s' % (kind_name, exc))
+
+                    if args.png:
+                        if info['format'] in ('Mono8', 'Mono16'):
+                            try:
+                                save_image(cam, frame, base, 'png')
+                            except Exception as exc:
+                                print('ПРЕДУПРЕЖДЕНИЕ: не удалось сохранить png: %s' % exc)
+                        else:
+                            print('PNG пропущен: формат %s — не изображение' % info['format'])
 
                     if args.measure:
                         try:
