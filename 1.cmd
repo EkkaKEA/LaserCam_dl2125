@@ -1,0 +1,1 @@
+python "C:\Program Files (x86)\MVS\Development\Samples\Python\dl2125_scan.py" --dump-params --dump-all
