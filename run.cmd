@@ -93,6 +93,22 @@ exit /b %errorlevel%
 "%PY%" "%SCRIPT%" --serial "%SN%" --params-save "%PARAMS%"
 exit /b %errorlevel%
 
+:c8
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --timeout 30000 --ply --png --raw --out "%OUT%"
+exit /b %errorlevel%
+
+:c9
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --free-run --timeout 10000 --ply --png --raw --out "%OUT%"
+exit /b %errorlevel%
+
+:c10
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --retriggers 200 --timeout 30000 --ply --png --raw --out "%OUT%"
+exit /b %errorlevel%
+
+:c11
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --burst 100 --timeout 30000 --ply --png --raw --out "%OUT%"
+exit /b %errorlevel%
+
 :no_script
 echo [ERROR] script not found: %SCRIPT%
 exit /b 1
