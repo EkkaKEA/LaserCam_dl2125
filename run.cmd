@@ -8,6 +8,14 @@ rem   4 - scan Range3D            5 - chunk Thickness + Image test
 rem   6 - working run (+ PLC/SCADA if MODBUS_HOST / JSON_HOST are set)
 rem   7 - save current camera params to file
 rem   8..13 - 3D PointCloud3D diagnostics (timeout / free-run / retriggers / burst / reopen / chunks)
+rem   14 - brightness check: Origin, free-run, exposure 5000 us, save PNG
+rem   15 - 3D scan: PointCloud3D + chunks, save PLY/CSV, measure height/volume
+rem   16 - 3D scan: chunks + burst 100 (many frames from one trigger)
+rem   17 - 3D scan: chunks + 101 software triggers (line-by-line assembly)
+rem   18 - 3D scan with CALIBRATION hypothesis: z-scale 10 (0.1 mm/unit), x 0.3125 mm/pt
+rem   19 - PNG with normal brightness: Origin, free-run, exposure 20000 us
+rem   20 - POINTS only: PointCloud3D + chunks, save PLY/CSV/RAW
+rem   21 - SIZES: PointCloud3D + chunks + measure (x=0.295 by checker cell, z=10 hypothesis)
 rem Overridable vars: PY (python), SN (camera serial)
 rem ---------------------------------------------------------------------------
 chcp 65001 >nul
@@ -41,7 +49,15 @@ if "%~1"=="10" goto c10
 if "%~1"=="11" goto c11
 if "%~1"=="12" goto c12
 if "%~1"=="13" goto c13
-echo [ERROR] unknown command "%~1", use: run.cmd 0..13
+if "%~1"=="14" goto c14
+if "%~1"=="15" goto c15
+if "%~1"=="16" goto c16
+if "%~1"=="17" goto c17
+if "%~1"=="18" goto c18
+if "%~1"=="19" goto c19
+if "%~1"=="20" goto c20
+if "%~1"=="21" goto c21
+echo [ERROR] unknown command "%~1", use: run.cmd 0..21
 exit /b 1
 
 :menu
@@ -57,6 +73,14 @@ echo  10 - 3D scan, 201 software triggers then wait 30 s
 echo  11 - 3D scan, burst of 100 frames per one trigger
 echo  12 - 3D scan, reopen camera after mode change (stream re-registration)
 echo  13 - 3D scan with chunk Image + Thickness enabled
+echo  14 - brightness check: Origin, free-run, exposure 5000 us, save PNG
+echo  15 - 3D scan: PointCloud3D + chunks, save PLY/CSV, measure height/volume
+echo  16 - 3D scan: chunks + burst 100 (many frames from one trigger)
+echo  17 - 3D scan: chunks + 101 software triggers (line-by-line assembly)
+echo  18 - 3D scan with calibration hypothesis: z-scale 10, x-mm-per-px 0.3125
+echo  19 - PNG with normal brightness (Origin, exposure 20000 us, free-run)
+echo  20 - points only: PointCloud3D + chunks, save PLY/CSV/RAW
+echo  21 - sizes: measure with calibrated scales (x 0.295 by checker, z-scale 10)
 exit /b 0
 
 :c0
@@ -120,6 +144,38 @@ exit /b %errorlevel%
 
 :c13
 "%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --chunk Image --chunk Thickness --timeout 10000 --ply --png --raw --out "%OUT%"
+exit /b %errorlevel%
+
+:c14
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode Origin --reopen --free-run --exposure 5000 --png --raw --out "%OUT%"
+exit /b %errorlevel%
+
+:c15
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --chunk Image --chunk Thickness --ply --csv --measure --timeout 10000 --out "%OUT%"
+exit /b %errorlevel%
+
+:c16
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 3 --image-mode PointCloud3D --chunk Image --chunk Thickness --burst 100 --ply --csv --measure --timeout 30000 --out "%OUT%"
+exit /b %errorlevel%
+
+:c17
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --chunk Image --chunk Thickness --retriggers 100 --ply --csv --measure --timeout 30000 --out "%OUT%"
+exit /b %errorlevel%
+
+:c18
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --chunk Image --chunk Thickness --z-scale 10 --x-mm-per-px 0.3125 --ply --csv --measure --timeout 10000 --out "%OUT%"
+exit /b %errorlevel%
+
+:c19
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode Origin --reopen --free-run --exposure 20000 --png --raw --out "%OUT%"
+exit /b %errorlevel%
+
+:c20
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --chunk Image --chunk Thickness --ply --csv --raw --timeout 10000 --out "%OUT%"
+exit /b %errorlevel%
+
+:c21
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --chunk Image --chunk Thickness --z-scale 10 --x-mm-per-px 0.295 --ply --csv --measure --timeout 10000 --out "%OUT%"
 exit /b %errorlevel%
 
 :no_script

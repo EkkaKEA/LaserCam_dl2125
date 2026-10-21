@@ -323,9 +323,12 @@ def register_stream_exception_callback(cam):
     global _STREAM_EXCEPTION_CB
     try:
         fun_ctype = get_platform_functype()
-        _STREAM_EXCEPTION_CB = fun_ctype(None, POINTER(MV_CC_STREAM_EXCEPTION_INFO), c_void_p)
+        # argtypes нужен СОБРАННЫЙ тип колбэка (у него есть from_param),
+        # а не фабрика CFUNCTYPE — иначе ctypes откажется преобразовывать
+        cb_type = fun_ctype(None, POINTER(MV_CC_STREAM_EXCEPTION_INFO), c_void_p)
+        _STREAM_EXCEPTION_CB = cb_type(_stream_exception_callback)
         dll = MvCamCtrldll
-        dll.MV_CC_RegisterExceptionCallBack.argtypes = (c_void_p, fun_ctype, c_void_p)
+        dll.MV_CC_RegisterExceptionCallBack.argtypes = (c_void_p, cb_type, c_void_p)
         dll.MV_CC_RegisterExceptionCallBack.restype = c_uint
         dll.MV_CC_RegisterExceptionCallBack(cam.handle, _STREAM_EXCEPTION_CB, None)
     except Exception as exc:
@@ -449,6 +452,7 @@ def load_camera_params(cam, path):
 PARAM_KEYWORDS = (
     '3d', 'height', 'laser', 'profile', 'coord', 'volume', 'point', 'cloud',
     'zmap', 'depth', 'scan', 'line', 'alg', 'measure', 'output', 'format',
+    'mode', 'unit', 'dws', 'lsl', 'range', 'tcp', 'event',
 )
 
 
@@ -474,20 +478,30 @@ def dump_camera_params(cam, path=None, show_all=False):
     if text is None:
         text = raw.decode('latin-1', errors='replace')
 
-    # Формат дампа: XML с Name="ИмяУзла" либо список "Имя=значение"
-    names = re.findall(r'Name="([^"]+)"', text)
-    if not names:
-        names = re.findall(r'^\s*([A-Za-z][A-Za-z0-9_]*)\s*=', text, re.M)
+    # Формат дампа: GenApi persistence — строки "Имя<TAB>значение" или "Имя = значение"
+    # (комментарии с # пропускаются); запасной вариант — XML с Name="ИмяУзла"
+    pairs = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        m = re.match(r'^([A-Za-z][A-Za-z0-9_]*)\s*(?:=|\t)\s*(.*?)\s*$', line)
+        if m:
+            pairs.append((m.group(1), m.group(2)))
+    if not pairs:
+        for name in re.findall(r'Name="([^"]+)"', text):
+            pairs.append((name, ''))
+    names = [n for n, _ in pairs]
 
     print('Параметров в камере: %d, дамп записан в %s' % (len(names), path))
-    matched = [n for n in names if any(k in n.lower() for k in PARAM_KEYWORDS)]
+    matched = [(n, v) for n, v in pairs if any(k in n.lower() for k in PARAM_KEYWORDS)]
     print('Узлы с ключевыми словами (%s): %d' % (', '.join(PARAM_KEYWORDS[:7]) + '...', len(matched)))
-    for n in matched:
-        print('  ', n)
+    for n, v in matched:
+        print('  %s = %s' % (n, v))
     if show_all:
         print('--- все узлы ---')
-        for n in names:
-            print('  ', n)
+        for n, v in pairs:
+            print('  %s = %s' % (n, v))
     return names, text
 
 
@@ -736,8 +750,8 @@ def _format_table():
         FORMAT_TABLE = {
             PixelType_Gvsp_Mono8: ('Mono8', 'u1', 1),
             PixelType_Gvsp_Mono16: ('Mono16', 'u2', 2),
-            # C16 — высота по одной оси, обычно в микрометрах (uint16)
-            PixelType_Gvsp_Coord3D_C16: ('Coord3D_C16', 'u2', 2),
+            # C16 этой камеры — ЗНАКОВЫЕ высоты int16 (сырое 0x8000 = -32768 = «нет данных»)
+            PixelType_Gvsp_Coord3D_C16: ('Coord3D_C16', 'i2', 2),
             PixelType_Gvsp_Coord3D_C32: ('Coord3D_C32', 'i4', 4),
             # C32f — высота в мм с плавающей точкой
             PixelType_Gvsp_Coord3D_C32f: ('Coord3D_C32f', 'f4', 4),
@@ -796,10 +810,11 @@ def frame_points_mm(frame, x_mm_per_px=0.1, y_mm_per_px=0.1, z_scale=1000.0):
     """Список точек (x_мм, y_мм, z_мм) для валидных пикселей кадра.
 
     Поддерживаемые форматы:
-      Coord3D_C16  — профиль высот в единицах SDK (мкм при z_scale=1000);
+      Coord3D_C16  — профиль высот, ЗНАКОВЫЕ int16 в единицах SDK
+                     (сырое 0x8000 = -32768 = «нет данных», 0 = нет отражения);
       Coord3D_C32f — высота в мм с плавающей точкой;
       Coord3D_ABC32f — готовые координаты X, Y, Z (калиброванные, мм).
-    Невалидные точки (0 / NaN) пропускаются.
+    Невалидные точки (0 / -32768 / NaN) пропускаются.
     Работает без numpy — на чистом Python (array).
     """
     import array as _array
@@ -807,10 +822,11 @@ def frame_points_mm(frame, x_mm_per_px=0.1, y_mm_per_px=0.1, z_scale=1000.0):
     pixel_type = frame['pixel_type']
     pts = []
     if pixel_type == PixelType_Gvsp_Coord3D_C16:
-        values = _array.array('H')  # uint16 little-endian
+        values = _array.array('h')  # int16 little-endian — значения знаковые
         values.frombytes(frame['data'])
         for idx, value in enumerate(values):
-            if value == 0:  # 0 = нет отражения/нет данных
+            # 0 — нет отражения; -32768 (сырое 0x8000) — маркер «нет данных»
+            if value in (0, -32768):
                 continue
             row, col = divmod(idx, width)
             pts.append((col * x_mm_per_px, row * y_mm_per_px, value / z_scale))
@@ -947,7 +963,8 @@ def measure_object(frame, z_scale=1000.0, x_mm_per_px=0.1, y_mm_per_px=0.1,
 
     Параметры калибровки:
       z_scale     — сколько единиц SDK приходится на 1 мм по оси Z
-                    (для Coord3D_C16 с микрометрами — 1000; для Coord3D_C32f в мм — 1);
+                    (Coord3D_C16: знаковые единицы измерителя — калибруется по
+                     известному размеру объекта; Coord3D_C32f в мм — 1);
       x_mm_per_px — размер пикселя по поперечной оси, мм;
       y_mm_per_px — шаг развёртки (или размер пикселя по продольной оси), мм;
       base_mm     — уровень опорной плоскости в мм. None — принять минимальную
@@ -964,7 +981,11 @@ def measure_object(frame, z_scale=1000.0, x_mm_per_px=0.1, y_mm_per_px=0.1,
     else:
         z = arr.astype(np.float64)
 
-    # Маскируем «пустые» точки: в Coord3D_C16 ноль = лазер не вернул отражение
+    # Маскируем «пустые» точки.
+    # Coord3D_C16 этой камеры: значения знаковые int16;
+    # -32768 (сырое 0x8000, 83% кадра!) = маркер «нет данных» измерителя — это НЕ высота;
+    # 0 = лазер не вернул отражение; для float-форматов — только NaN и 0.
+    invalid_values = tuple(sorted(set(tuple(invalid_values) + (-32768, 32768))))
     mask = np.ones(z.shape, dtype=bool)
     for bad in invalid_values:
         if bad is None:
@@ -1107,6 +1128,8 @@ def print_scan_report(index, info, results=None):
           % (results['valid_points'], results['total_points'], results['fill_ratio'] * 100))
     print('высота: %.3f мм' % results['height_mm'])
     print('объём:  %.3f см3' % results['volume_cm3'])
+    print('сырые единицы Z: база %.0f, макс %.0f (для калибровки --z-scale)'
+          % (results['z_base_raw'], results['z_max_raw']))
     print('габариты поля: %.1f x %.1f мм' % (results['bbox_x_mm'], results['bbox_y_mm']))
 
 
@@ -1219,7 +1242,8 @@ def run_scan(args):
                             except Exception as exc:
                                 print('ПРЕДУПРЕЖДЕНИЕ: не удалось сохранить png: %s' % exc)
                         else:
-                            print('PNG пропущен: формат %s — не изображение' % info['format'])
+                            print('PNG пропущен: формат %s — не изображение. Для PNG переключите режим: '
+                                  '--image-mode Origin' % info['format'])
 
                     if args.measure:
                         try:
@@ -1296,7 +1320,7 @@ def build_parser():
 
     p.add_argument('--measure', action='store_true', help='считать высоту и объём')
     p.add_argument('--z-scale', type=float, default=1000.0,
-                   help='единиц SDK на 1 мм по Z (1000 для микрометров, 1 для мм)')
+                   help='единиц SDK на 1 мм по Z (знаковые единицы C16 — калибруются, обычно 1000; 1 для мм)')
     p.add_argument('--x-mm-per-px', type=float, default=0.1, help='размер пикселя по X, мм')
     p.add_argument('--y-mm-per-px', type=float, default=0.1, help='размер пикселя по Y, мм')
     p.add_argument('--base-mm', type=float, default=None,
