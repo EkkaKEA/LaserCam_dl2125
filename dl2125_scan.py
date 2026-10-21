@@ -1052,6 +1052,15 @@ def run_scan(args):
         print('Параметры съёмки: поле %d x %d, PixelFormat=0x%08X, PayloadSize=%d'
               % (w_cur, h_cur, get_pixel_format(cam), get_payload_size(cam)))
 
+        # После смены режима видеопоток GigE может остаться «старым»: переоткрываем
+        # камеру, чтобы SDK заново зарегистрировал канал потока под новый payload.
+        if args.reopen:
+            print('Переоткрытие камеры для перерегистрации видеопотока...')
+            close_camera(cam)
+            cam = open_camera(device_info)
+            print('Камера переоткрыта: PixelFormat=0x%08X, PayloadSize=%d'
+                  % (get_pixel_format(cam), get_payload_size(cam)))
+
         if args.free_run:
             set_trigger_off(cam)      # непрерывный поток кадров
         else:
@@ -1161,6 +1170,8 @@ def build_parser():
                    help='AcquisitionBurstFrameCount: сколько кадров отдаёт камера на один TriggerSoftware')
     p.add_argument('--retriggers', type=int, default=0,
                    help='дополнительные TriggerSoftware перед забором кадра (серия линий для сборки 3D)')
+    p.add_argument('--reopen', action='store_true',
+                   help='после смены режима переоткрыть камеру (перерегистрация видеопотока GigE)')
 
     p.add_argument('--out', default='./out', help='каталог для результатов')
     p.add_argument('--ply', action='store_true', help='сохранять облако точек в PLY')

@@ -7,6 +7,7 @@ rem   2 - dump all camera params  3 - scan PointCloud3D (PLY/PNG/RAW + measure)
 rem   4 - scan Range3D            5 - chunk Thickness + Image test
 rem   6 - working run (+ PLC/SCADA if MODBUS_HOST / JSON_HOST are set)
 rem   7 - save current camera params to file
+rem   8..13 - 3D PointCloud3D diagnostics (timeout / free-run / retriggers / burst / reopen / chunks)
 rem Overridable vars: PY (python), SN (camera serial)
 rem ---------------------------------------------------------------------------
 chcp 65001 >nul
@@ -38,7 +39,9 @@ if "%~1"=="8" goto c8
 if "%~1"=="9" goto c9
 if "%~1"=="10" goto c10
 if "%~1"=="11" goto c11
-echo [ERROR] unknown command "%~1", use: run.cmd 0..11
+if "%~1"=="12" goto c12
+if "%~1"=="13" goto c13
+echo [ERROR] unknown command "%~1", use: run.cmd 0..13
 exit /b 1
 
 :menu
@@ -52,6 +55,8 @@ echo   8 - 3D scan, one trigger, long timeout 30 s
 echo   9 - 3D scan in free-run (no trigger, does ANY frame arrive?)
 echo  10 - 3D scan, 201 software triggers then wait 30 s
 echo  11 - 3D scan, burst of 100 frames per one trigger
+echo  12 - 3D scan, reopen camera after mode change (stream re-registration)
+echo  13 - 3D scan with chunk Image + Thickness enabled
 exit /b 0
 
 :c0
@@ -107,6 +112,14 @@ exit /b %errorlevel%
 
 :c11
 "%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --burst 100 --timeout 30000 --ply --png --raw --out "%OUT%"
+exit /b %errorlevel%
+
+:c12
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --reopen --timeout 10000 --ply --png --raw --out "%OUT%"
+exit /b %errorlevel%
+
+:c13
+"%PY%" "%SCRIPT%" --serial "%SN%" --count 1 --image-mode PointCloud3D --chunk Image --chunk Thickness --timeout 10000 --ply --png --raw --out "%OUT%"
 exit /b %errorlevel%
 
 :no_script
